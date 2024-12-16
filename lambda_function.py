@@ -6,7 +6,6 @@ from datetime import datetime
 from boto3.dynamodb.conditions import Key, Attr
 import traceback
 import concurrent.futures
-from functools import lru_cache
 
 # Initialize AWS clients and resources.
 sqs = boto3.client('sqs')
@@ -91,45 +90,34 @@ def invoke_fcm_lambda(notification_type, message_text, patient_id, supervisor_id
 
     print("FCM Lambda invoked with response:", response)  # Debug print
 
-# Cache configuration
-CACHE_SIZE = 128
+# def get_smart_notifications_by_category(patient_id, category):
+#     try:
+#         # Use the query method to retrieve notifications based on patient_id and category
+#         response = smart_notification_table.query(
+#             IndexName='patient_id-category-index',
+#             KeyConditionExpression=Key('patient_id').eq(patient_id) & Key('category').eq(category),
+#             ScanIndexForward=True,
+#             Limit=20
+#         )
 
-@lru_cache(maxsize=CACHE_SIZE)
-def get_device_ids_by_patient_id(patient_id):
-    response = device_location_table.query(
-        IndexName='patient_id-index',
-        KeyConditionExpression=Key('patient_id').eq(patient_id)
-    )
-    return [item['device_id'] for item in response['Items']]
+#         # Extract the items from the response
+#         notifications = response['Items']
 
-@lru_cache(maxsize=CACHE_SIZE)
-def get_device_ids_by_supervisor_id(supervisor_id):
-    response = nurse_patient_table.query(
-        KeyConditionExpression=Key('supervisor_id').eq(supervisor_id)
-    )
-    patient_ids = [item['patient_id'] for item in response['Items']]
-    device_ids = []
-    for patient_id in patient_ids:
-        device_ids.extend(get_device_ids_by_patient_id(patient_id))
-    return device_ids
+#         # Convert timestamps to human-readable format
+#         notifications = [convert_timestamp(item) for item in notifications]
 
-@lru_cache(maxsize=CACHE_SIZE)
-def get_device_ids_by_facility_id(facility_id):
-    response = patient_facility_table.query(
-        IndexName='facility_id-index',
-        KeyConditionExpression=Key('facility_id').eq(facility_id)
-    )
-    patient_ids = [item['patient_id'] for item in response['Items']]
-    device_ids = []
-    for patient_id in patient_ids:
-        device_ids.extend(get_device_ids_by_patient_id(patient_id))
-    return device_ids
+#         return notifications
+
+#     except Exception as e:
+#         print('Error getting smart notifications by category:', e)
+#         print("stack trace", traceback.format_exc())
+#         raise RuntimeError('Error getting smart notifications by category')
 
 def get_smart_notifications(device_id=None, patient_id=None, supervisor_id=None, facility_id=None):
     try:
         device_ids = []
-        notifications = []
 
+        # If no identifiers are provided, scan the entire table
         if device_id is None and patient_id is None and supervisor_id is None and facility_id is None:
             response = smart_notification_table.scan(
                 FilterExpression=Attr('resolved').eq(False),
@@ -137,29 +125,77 @@ def get_smart_notifications(device_id=None, patient_id=None, supervisor_id=None,
             )
             notifications = response['Items']
         else:
+            # Retrieve device_ids based on provided identifiers (facility_id, patient_id, etc.)
             if facility_id:
-                device_ids = get_device_ids_by_facility_id(facility_id)
+                # Get patient_ids associated with the facility_id
+                response = patient_facility_table.query(
+                    IndexName='facility_id-index',
+                    KeyConditionExpression=Key('facility_id').eq(facility_id)
+                )
+                print(f'Facility response: {response}')  # Debug print
+                patient_ids = [item['patient_id'] for item in response['Items']]
+
+                # Get device_ids associated with the patient_ids
+                for patient_id in patient_ids:
+                    response = device_location_table.query(
+                        IndexName='patient_id-index',
+                        KeyConditionExpression=Key('patient_id').eq(patient_id)
+                    )
+                    print(f'Device location response for patient_id {patient_id}: {response}')  # Debug print
+                    device_ids.extend([item['device_id'] for item in response['Items']])
             elif patient_id:
-                device_ids = get_device_ids_by_patient_id(patient_id)
+                # Get device_ids associated with the patient_id
+                response = device_location_table.query(
+                    IndexName='patient_id-index',
+                    KeyConditionExpression=Key('patient_id').eq(patient_id)
+                )
+                print(f'Device location response for patient_id {patient_id}: {response}')  # Debug print
+                device_ids = [item['device_id'] for item in response['Items']]
             elif supervisor_id:
-                device_ids = get_device_ids_by_supervisor_id(supervisor_id)
+                # Get device_ids associated with the patient_id
+                response = nurse_patient_table.query(
+                    KeyConditionExpression=Key('supervisor_id').eq(supervisor_id)
+                )
+                print(f'Nurse-patient response for supervisor_id {supervisor_id}: {response}')  # Debug print
+                patient_ids = [item['patient_id'] for item in response['Items']]
+
+                # Get device_ids associated with the patient_ids
+                for patient_id in patient_ids:
+                    response = device_location_table.query(
+                        IndexName='patient_id-index',
+                        KeyConditionExpression=Key('patient_id').eq(patient_id)
+                    )
+                    print(f'Device location response for patient_id {patient_id}: {response}')  # Debug print
+                    device_ids.extend([item['device_id'] for item in response['Items']])
             elif device_id:
                 device_ids = [device_id]
 
+            notifications = []
+
+            # Use concurrent futures to query notifications in parallel for each device_id
             with concurrent.futures.ThreadPoolExecutor() as executor:
+                # Submit queries for each device_id to the executor
                 future_to_device = {executor.submit(query_device_notifications, device_id): device_id for device_id in device_ids}
+
+                # Collect all the notifications returned by the queries
                 for future in concurrent.futures.as_completed(future_to_device):
                     device_notifications = future.result()
+                    print(f'Notifications for device_id {future_to_device[future]}: {device_notifications}')  # Debug print
                     notifications.extend(device_notifications)
 
+        # Sort all notifications by the timestamp (descending)
         notifications = sorted(notifications, key=lambda x: x['timestamp'], reverse=False)
+
+        # Convert timestamps to human-readable format
         notifications = [convert_timestamp(item) for item in notifications]
-        return notifications[:20]
+
+        return notifications[:20]  # Return up to 20 notifications
 
     except Exception as e:
         print('Error getting smart notifications:', e)
         print("stack trace", traceback.format_exc())
         raise RuntimeError('Error getting smart notifications')
+
 def query_device_notifications(device_id):
     """Helper function to query notifications for a given device_id."""
     last_evaluated_key = None
@@ -243,6 +279,11 @@ def is_within_cooldown(device_id, timestamp):
             # print((timestamp - last_timestamp).total_seconds())
             # print(cooldown_period)
             time_difference = (current_timestamp - last_timestamp).total_seconds()
+
+            print(f"Last Notification Timestamp: {last_timestamp}")
+            print(f"Current Notification Timestamp: {current_timestamp}")
+            print(f"Cooldown Period (seconds): {cooldown_period}")
+            print(f"Time Difference (seconds): {time_difference}")
 
             if time_difference < cooldown_period:
                 return True  # Cooldown is still active
@@ -340,7 +381,9 @@ def handle_sqs_event(event):
             light_value = float(message_body.get('light'))
             sound_value = float(message_body.get('sound'))
             temp_value = float(message_body.get('temp'))
-
+            print("Light value:", light_value)  # Debug print
+            print("Sound value:", sound_value)  # Debug print
+            print("Temperature value:", temp_value)  # Debug print
 
             # Extract relevant threshold values
             ambient_light_min = float(threshold_data.get('ambient_light_min'))
@@ -349,6 +392,12 @@ def handle_sqs_event(event):
             ambient_sound_max = float(threshold_data.get('ambient_sound_max'))
             ambient_temperature_min = float(threshold_data.get('ambient_temperature_min'))
             ambient_temperature_max = float(threshold_data.get('ambient_temperature_max'))
+            print("Ambient light min:", ambient_light_min)  # Debug print
+            print("Ambient light max:", ambient_light_max)  # Debug print
+            print("Ambient sound min:", ambient_sound_min)  # Debug print
+            print("Ambient sound max:", ambient_sound_max)  # Debug print
+            print("Ambient temperature min:", ambient_temperature_min)  # Debug print
+            print("Ambient temperature max:", ambient_temperature_max)  # Debug print
 
             timestamp_dt = datetime.fromisoformat(timestamp)
 
