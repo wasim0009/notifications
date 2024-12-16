@@ -166,7 +166,7 @@ def query_device_notifications(device_ids):
 
     return device_notifications
 
-def get_smart_notifications(device_id=None, patient_id=None, supervisor_id=None, facility_id=None):
+def get_smart_notifications(device_id=None, patient_id=None, supervisor_id=None, facility_id=None, page=0):
     try:
         device_ids = []
 
@@ -187,7 +187,9 @@ def get_smart_notifications(device_id=None, patient_id=None, supervisor_id=None,
 
         notifications = sorted(notifications, key=lambda x: x['timestamp'], reverse=False)
 
-        return notifications[:20]  # Return up to 20 notifications
+        # Implement pagination to accumulate results
+        end = (page + 1) * 20
+        return notifications[:end]  # Return accumulated results up to the specified page
     except Exception as e:
         print('Error getting smart notifications:', e)
         print("stack trace", traceback.format_exc())
@@ -462,12 +464,9 @@ def lambda_handler(event, context):
                 patient_id = params.get('patient_id')
                 facility_id = params.get('facility_id')
                 supervisor_id = params.get('supervisor_id')
-                # category = params.get('category')
+                page = int(params.get('page', 0))  # Default to 0 if not provided
 
-                # if category:
-                #     notifications = get_smart_notifications_by_category(patient_id, category)
-                # else:
-                notifications = get_smart_notifications(device_id, patient_id, supervisor_id, facility_id)
+                notifications = get_smart_notifications(device_id, patient_id, supervisor_id, facility_id, page)
 
                 notifications = sorted(notifications, key=lambda x: x['timestamp'], reverse=False)
 
