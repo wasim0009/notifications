@@ -113,115 +113,85 @@ def invoke_fcm_lambda(notification_type, message_text, patient_id, supervisor_id
 #         print("stack trace", traceback.format_exc())
 #         raise RuntimeError('Error getting smart notifications by category')
 
+def get_device_ids_by_facility(facility_id):
+    response = patient_facility_table.query(
+        IndexName='facility_id-index',
+        KeyConditionExpression=Key('facility_id').eq(facility_id)
+    )
+    return [item['patient_id'] for item in response['Items']]
+
+def get_device_ids_by_patient(patient_id):
+    response = device_location_table.query(
+        IndexName='patient_id-index',
+        KeyConditionExpression=Key('patient_id').eq(patient_id)
+    )
+    return [item['device_id'] for item in response['Items']]
+
+def get_device_ids_by_supervisor(supervisor_id):
+    response = nurse_patient_table.query(
+        KeyConditionExpression=Key('supervisor_id').eq(supervisor_id)
+    )
+    patient_ids = [item['patient_id'] for item in response['Items']]
+    device_ids = []
+    for pid in patient_ids:
+        device_ids.extend(get_device_ids_by_patient(pid))
+    return device_ids
+
+def query_device_notifications(device_ids):
+    """Helper function to query notifications for a list of device_ids."""
+    device_notifications = []
+
+    for device_id in device_ids:
+        last_evaluated_key = None
+
+        while True:
+            query_params = {
+                "IndexName": 'device_id-timestamp-index',
+                "KeyConditionExpression": Key('device_id').eq(device_id),
+                "FilterExpression": Attr('resolved').eq(False),
+                "ScanIndexForward": True,
+                "Limit": 20
+            }
+
+            if last_evaluated_key is not None:
+                query_params["ExclusiveStartKey"] = last_evaluated_key
+
+            response = smart_notification_table.query(**query_params)
+            device_notifications.extend(response['Items'])
+
+            if len(device_notifications) >= 20 or 'LastEvaluatedKey' not in response:
+                break
+
+            last_evaluated_key = response.get('LastEvaluatedKey')
+
+    return device_notifications
+
 def get_smart_notifications(device_id=None, patient_id=None, supervisor_id=None, facility_id=None):
     try:
         device_ids = []
 
-        # If no identifiers are provided, scan the entire table
-        if device_id is None and patient_id is None and supervisor_id is None and facility_id is None:
-            response = smart_notification_table.scan(
-                FilterExpression=Attr('resolved').eq(False),
-                Limit=100
-            )
-            notifications = response['Items']
-        else:
-            # Retrieve device_ids based on provided identifiers (facility_id, patient_id, etc.)
-            if facility_id:
-                # Get patient_ids associated with the facility_id
-                response = patient_facility_table.query(
-                    IndexName='facility_id-index',
-                    KeyConditionExpression=Key('facility_id').eq(facility_id)
-                )
-                print(f'Facility response: {response}')  # Debug print
-                patient_ids = [item['patient_id'] for item in response['Items']]
+        if facility_id:
+            device_ids = get_device_ids_by_facility(facility_id)
+        elif patient_id:
+            device_ids = get_device_ids_by_patient(patient_id)
+        elif supervisor_id:
+            device_ids = get_device_ids_by_supervisor(supervisor_id)
+        elif device_id:
+            device_ids.append(device_id)
 
-                # Get device_ids associated with the patient_ids
-                for patient_id in patient_ids:
-                    response = device_location_table.query(
-                        IndexName='patient_id-index',
-                        KeyConditionExpression=Key('patient_id').eq(patient_id)
-                    )
-                    print(f'Device location response for patient_id {patient_id}: {response}')  # Debug print
-                    device_ids.extend([item['device_id'] for item in response['Items']])
-            elif patient_id:
-                # Get device_ids associated with the patient_id
-                response = device_location_table.query(
-                    IndexName='patient_id-index',
-                    KeyConditionExpression=Key('patient_id').eq(patient_id)
-                )
-                print(f'Device location response for patient_id {patient_id}: {response}')  # Debug print
-                device_ids = [item['device_id'] for item in response['Items']]
-            elif supervisor_id:
-                # Get device_ids associated with the patient_id
-                response = nurse_patient_table.query(
-                    KeyConditionExpression=Key('supervisor_id').eq(supervisor_id)
-                )
-                print(f'Nurse-patient response for supervisor_id {supervisor_id}: {response}')  # Debug print
-                patient_ids = [item['patient_id'] for item in response['Items']]
+        notifications = query_device_notifications(device_ids)
 
-                # Get device_ids associated with the patient_ids
-                for patient_id in patient_ids:
-                    response = device_location_table.query(
-                        IndexName='patient_id-index',
-                        KeyConditionExpression=Key('patient_id').eq(patient_id)
-                    )
-                    print(f'Device location response for patient_id {patient_id}: {response}')  # Debug print
-                    device_ids.extend([item['device_id'] for item in response['Items']])
-            elif device_id:
-                device_ids = [device_id]
+        # Convert timestamps and sort in a single pass
+        for item in notifications:
+            item['timestamp'] = datetime.fromisoformat(item['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
 
-            notifications = []
-
-            # Use concurrent futures to query notifications in parallel for each device_id
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                # Submit queries for each device_id to the executor
-                future_to_device = {executor.submit(query_device_notifications, device_id): device_id for device_id in device_ids}
-
-                # Collect all the notifications returned by the queries
-                for future in concurrent.futures.as_completed(future_to_device):
-                    device_notifications = future.result()
-                    print(f'Notifications for device_id {future_to_device[future]}: {device_notifications}')  # Debug print
-                    notifications.extend(device_notifications)
-
-        # Sort all notifications by the timestamp (descending)
         notifications = sorted(notifications, key=lambda x: x['timestamp'], reverse=False)
 
-        # Convert timestamps to human-readable format
-        notifications = [convert_timestamp(item) for item in notifications]
-
         return notifications[:20]  # Return up to 20 notifications
-
     except Exception as e:
         print('Error getting smart notifications:', e)
         print("stack trace", traceback.format_exc())
         raise RuntimeError('Error getting smart notifications')
-
-def query_device_notifications(device_id):
-    """Helper function to query notifications for a given device_id."""
-    last_evaluated_key = None
-    device_notifications = []
-
-    while True:
-        query_params = {
-            "IndexName": 'device_id-timestamp-index',
-            "KeyConditionExpression": Key('device_id').eq(device_id),
-            "FilterExpression": Attr('resolved').eq(False),
-            "ScanIndexForward": True,
-            "Limit": 20
-        }
-
-        if last_evaluated_key is not None:
-            query_params["ExclusiveStartKey"] = last_evaluated_key
-
-        response = smart_notification_table.query(**query_params)
-        device_notifications.extend(response['Items'])
-
-        if len(device_notifications) >= 20 or 'LastEvaluatedKey' not in response:
-            break
-
-        last_evaluated_key = response.get('LastEvaluatedKey')
-
-    return device_notifications
 
 def convert_timestamp(item):
     timestamp_str = item['timestamp']
