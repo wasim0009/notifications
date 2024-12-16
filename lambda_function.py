@@ -149,8 +149,8 @@ def query_device_notifications(device_ids):
                 "IndexName": 'device_id-timestamp-index',
                 "KeyConditionExpression": Key('device_id').eq(device_id),
                 "FilterExpression": Attr('resolved').eq(False),
-                "ScanIndexForward": True,
-                "Limit": 20
+                "ScanIndexForward": True
+                # "Limit": 20
             }
 
             if last_evaluated_key is not None:
@@ -187,9 +187,11 @@ def get_smart_notifications(device_id=None, patient_id=None, supervisor_id=None,
 
         notifications = sorted(notifications, key=lambda x: x['timestamp'], reverse=False)
 
-        # Implement pagination to accumulate results
+        # Implement pagination to return results in sets of 20
+        start = page * 20
         end = (page + 1) * 20
-        return notifications[:end]  # Return accumulated results up to the specified page
+        return notifications[start:end]  # Return notifications for the specified page
+
     except Exception as e:
         print('Error getting smart notifications:', e)
         print("stack trace", traceback.format_exc())
@@ -464,9 +466,14 @@ def lambda_handler(event, context):
                 patient_id = params.get('patient_id')
                 facility_id = params.get('facility_id')
                 supervisor_id = params.get('supervisor_id')
-                page = int(params.get('page', 0))  # Default to 0 if not provided
 
-                notifications = get_smart_notifications(device_id, patient_id, supervisor_id, facility_id, page)
+                # If no parameters are provided, perform a full scan on the 'smart_notification_table'
+                if not any([device_id, patient_id, facility_id, supervisor_id]):
+                    response = smart_notification_table.scan(Limit=100)
+                    notifications = response.get('Items', [])
+                else:
+                    page = int(params.get('page', 0))  # Default to 0 if not provided
+                    notifications = get_smart_notifications(device_id, patient_id, supervisor_id, facility_id, page)
 
                 notifications = sorted(notifications, key=lambda x: x['timestamp'], reverse=False)
 
